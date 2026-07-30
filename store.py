@@ -1,84 +1,107 @@
-import sqlite3
+import os
 import json
 from datetime import datetime, timezone
 
+import psycopg2
+from psycopg2.extras import execute_values
+from dotenv import load_dotenv
+
 from fetch import fetch_all_markets, get_volume_24hr
 
-DB_PATH = "markets.db"
+load_dotenv()
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS markets (
+    id          TEXT PRIMARY KEY,
+    platform    TEXT NOT NULL DEFAULT 'polymarket',
+    question    TEXT NOT NULL,
+    slug        TEXT,
+    outcomes    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+    id           BIGSERIAL PRIMARY KEY,
+    market_id    TEXT NOT NULL REFERENCES markets(id),
+    captured_at  TIMESTAMPTZ NOT NULL,
+    price        DOUBLE PRECISION,
+    volume_24hr  DOUBLE PRECISION
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_market_time
+    ON snapshots(market_id, captured_at);
+"""
 
 
 def init_db(conn):
-    """Create tables if they don't exist yet. Safe to run every time."""
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS markets (
-            id          TEXT PRIMARY KEY,
-            question    TEXT NOT NULL,
-            slug        TEXT,
-            outcomes    TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS snapshots (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            market_id    TEXT NOT NULL,
-            captured_at  TEXT NOT NULL,
-            price        REAL,
-            volume_24hr  REAL,
-            FOREIGN KEY (market_id) REFERENCES markets(id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_snapshots_market_time
-            ON snapshots(market_id, captured_at);
-    """)
+    with conn.cursor() as cur:
+        cur.execute(SCHEMA)
     conn.commit()
 
 
-def save_market(conn, m):
-    """Upsert the market's static info."""
-    conn.execute(
-        """INSERT OR REPLACE INTO markets (id, question, slug, outcomes)
-           VALUES (?, ?, ?, ?)""",
-        (m["id"], m["question"], m.get("slug"), m.get("outcomes")),
-    )
-
-
-def save_snapshot(conn, m, captured_at):
-    """Append one price observation for this market."""
+def extract_price(m):
+    """First outcome's price. Yes side on binary markets."""
     prices = json.loads(m["outcomePrices"])
-    price = float(prices[0]) if prices else None
-
-    conn.execute(
-        """INSERT INTO snapshots (market_id, captured_at, price, volume_24hr)
-           VALUES (?, ?, ?, ?)""",
-        (m["id"], captured_at, price, get_volume_24hr(m)),
-    )
+    return float(prices[0]) if prices else None
 
 
-def collect():
-    captured_at = datetime.now(timezone.utc).isoformat()
-    markets = fetch_all_markets()
-    print(f"\nFetched {len(markets)} markets")
+def build_rows(markets, captured_at, platform="polymarket"):
+    """Turn API records into DB rows, deduped by market id."""
+    market_rows = {}
+    snapshot_rows = {}
 
-    conn = sqlite3.connect(DB_PATH)
-    init_db(conn)
-
-    saved = 0
     for m in markets:
         try:
-            save_market(conn, m)
-            save_snapshot(conn, m, captured_at)
-            saved += 1
+            mid = m["id"]
+            market_rows[mid] = (
+                mid, platform, m["question"], m.get("slug"), m.get("outcomes"),
+            )
+            snapshot_rows[mid] = (
+                mid, captured_at, extract_price(m), get_volume_24hr(m),
+            )
         except (KeyError, ValueError, json.JSONDecodeError) as e:
             print(f"  skipped {m.get('id')}: {e}")
 
-    conn.commit()
+    return list(market_rows.values()), list(snapshot_rows.values())
 
-    total = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
-    runs = conn.execute(
-        "SELECT COUNT(DISTINCT captured_at) FROM snapshots"
-    ).fetchone()[0]
-    conn.close()
 
-    print(f"Saved {saved} snapshots at {captured_at}")
+def collect():
+    captured_at = datetime.now(timezone.utc)
+    markets = fetch_all_markets()
+    print(f"\nFetched {len(markets)} markets")
+
+    market_rows, snapshot_rows = build_rows(markets, captured_at)
+
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        init_db(conn)
+
+        with conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO markets (id, platform, question, slug, outcomes)
+                VALUES %s
+                ON CONFLICT (id) DO UPDATE SET
+                    question = EXCLUDED.question,
+                    slug     = EXCLUDED.slug,
+                    outcomes = EXCLUDED.outcomes
+            """, market_rows)
+
+            execute_values(cur, """
+                INSERT INTO snapshots (market_id, captured_at, price, volume_24hr)
+                VALUES %s
+            """, snapshot_rows)
+
+            cur.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT captured_at) FROM snapshots"
+            )
+            total, runs = cur.fetchone()
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(f"Saved {len(snapshot_rows)} snapshots at {captured_at.isoformat()}")
     print(f"Database now holds {total} snapshots across {runs} runs")
 
 
