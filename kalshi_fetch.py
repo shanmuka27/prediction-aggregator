@@ -17,8 +17,7 @@ def fetch_all_markets(days_ahead=30, page_size=200, max_pages=40):
     """
     Open markets closing within `days_ahead`.
 
-    Kalshi lists tens of thousands of auto-generated sports contracts that
-    never trade. Bounding by close time skips nearly all of them.
+    Kalshi rate limits bursts, so we pace requests and back off on 429.
     """
     cutoff = int(time.time()) + days_ahead * 86400
     all_markets = []
@@ -29,9 +28,23 @@ def fetch_all_markets(days_ahead=30, page_size=200, max_pages=40):
         if cursor:
             params["cursor"] = cursor
 
-        resp = requests.get(f"{BASE}/markets", params=params, timeout=15)
-        resp.raise_for_status()
-        payload = resp.json()
+        payload = None
+        for attempt in range(5):
+            resp = requests.get(f"{BASE}/markets", params=params, timeout=15)
+
+            if resp.status_code == 429:
+                wait = 2 ** attempt
+                print(f"  kalshi: rate limited, waiting {wait}s")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            payload = resp.json()
+            break
+
+        if payload is None:
+            print("  kalshi: giving up after repeated rate limits")
+            break
 
         page = payload.get("markets", [])
         if not page:
@@ -43,6 +56,8 @@ def fetch_all_markets(days_ahead=30, page_size=200, max_pages=40):
         cursor = payload.get("cursor")
         if not cursor:
             break
+
+        time.sleep(0.3)
 
     return all_markets
 
