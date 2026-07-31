@@ -77,3 +77,27 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def normalize(m):
+    """Convert a Polymarket market into our common shape."""
+    prices = json.loads(m["outcomePrices"])
+    return {
+        "id": m["id"],
+        "platform": "polymarket",
+        "question": m["question"],
+        "slug": m.get("slug"),
+        "outcomes": m.get("outcomes"),
+        "price": float(prices[0]) if prices else None,
+        "volume_24hr": get_volume_24hr(m),
+    }
+
+
+def fetch_normalized():
+    """Polymarket markets in our common shape."""
+    records = []
+    for m in fetch_all_markets():
+        try:
+            records.append(normalize(m))
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            print(f"  skipped {m.get('id')}: {e}")
+    return records

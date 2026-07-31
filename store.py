@@ -1,12 +1,12 @@
 import os
-import json
 from datetime import datetime, timezone
 
 import psycopg2
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
-from fetch import fetch_all_markets, get_volume_24hr
+from fetch import fetch_normalized as fetch_polymarket
+from kalshi_fetch import fetch_normalized as fetch_kalshi
 
 load_dotenv()
 
@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_market_time
     ON snapshots(market_id, captured_at);
+
+CREATE INDEX IF NOT EXISTS idx_markets_platform
+    ON markets(platform);
 """
 
 
@@ -40,38 +43,46 @@ def init_db(conn):
     conn.commit()
 
 
-def extract_price(m):
-    """First outcome's price. Yes side on binary markets."""
-    prices = json.loads(m["outcomePrices"])
-    return float(prices[0]) if prices else None
+def gather():
+    """Pull from every platform. One source failing shouldn't kill the run."""
+    records = []
 
-
-def build_rows(markets, captured_at, platform="polymarket"):
-    """Turn API records into DB rows, deduped by market id."""
-    market_rows = {}
-    snapshot_rows = {}
-
-    for m in markets:
+    for name, fetcher in [("polymarket", fetch_polymarket), ("kalshi", fetch_kalshi)]:
         try:
-            mid = m["id"]
-            market_rows[mid] = (
-                mid, platform, m["question"], m.get("slug"), m.get("outcomes"),
-            )
-            snapshot_rows[mid] = (
-                mid, captured_at, extract_price(m), get_volume_24hr(m),
-            )
-        except (KeyError, ValueError, json.JSONDecodeError) as e:
-            print(f"  skipped {m.get('id')}: {e}")
+            got = fetcher()
+            print(f"{name}: {len(got)} records")
+            records.extend(got)
+        except Exception as e:
+            print(f"{name} FAILED: {e}")
 
-    return list(market_rows.values()), list(snapshot_rows.values())
+    return records
+
+
+def to_rows(records, captured_at):
+    """Dedupe by id, split into market rows and snapshot rows."""
+    markets = {}
+    snapshots = {}
+
+    for r in records:
+        markets[r["id"]] = (
+            r["id"], r["platform"], r["question"], r["slug"], r["outcomes"],
+        )
+        snapshots[r["id"]] = (
+            r["id"], captured_at, r["price"], r["volume_24hr"],
+        )
+
+    return list(markets.values()), list(snapshots.values())
 
 
 def collect():
     captured_at = datetime.now(timezone.utc)
-    markets = fetch_all_markets()
-    print(f"\nFetched {len(markets)} markets")
+    records = gather()
 
-    market_rows, snapshot_rows = build_rows(markets, captured_at)
+    if not records:
+        print("nothing fetched, skipping write")
+        return
+
+    market_rows, snapshot_rows = to_rows(records, captured_at)
 
     conn = psycopg2.connect(DATABASE_URL)
     try:
@@ -82,6 +93,7 @@ def collect():
                 INSERT INTO markets (id, platform, question, slug, outcomes)
                 VALUES %s
                 ON CONFLICT (id) DO UPDATE SET
+                    platform = EXCLUDED.platform,
                     question = EXCLUDED.question,
                     slug     = EXCLUDED.slug,
                     outcomes = EXCLUDED.outcomes
@@ -92,17 +104,20 @@ def collect():
                 VALUES %s
             """, snapshot_rows)
 
-            cur.execute(
-                "SELECT COUNT(*), COUNT(DISTINCT captured_at) FROM snapshots"
-            )
-            total, runs = cur.fetchone()
+            cur.execute("""
+                SELECT m.platform, COUNT(*)
+                FROM snapshots s JOIN markets m ON m.id = s.market_id
+                GROUP BY m.platform
+            """)
+            by_platform = cur.fetchall()
 
         conn.commit()
     finally:
         conn.close()
 
-    print(f"Saved {len(snapshot_rows)} snapshots at {captured_at.isoformat()}")
-    print(f"Database now holds {total} snapshots across {runs} runs")
+    print(f"\nSaved {len(snapshot_rows)} snapshots at {captured_at.isoformat()}")
+    for platform, count in by_platform:
+        print(f"  {platform}: {count} total snapshots")
 
 
 if __name__ == "__main__":
